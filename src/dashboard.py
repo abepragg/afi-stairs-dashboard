@@ -1,7 +1,12 @@
-# ♿ Difficulty climbing stairs — Household projections dashboard
-# Data: data/prep_PEC19.csv, data/raw_F4006.csv, data/Households_size_2022.csv
-# Method: Q15(c) prevalence (C12 + C13) × demography → person share → household share;
-#         plus buggy proxy = all children aged 0–3 (not filtered by disability).
+# ♿ Difficulty with basic physical activities (incl. climbing stairs) — Projections
+# Focus: Q15(c) ONLY (F4006C12 "to some extent" + F4006C13 "to a great extent")
+# Answer shown in TWO ways:
+#   1) People counts (by year, sex, age band)
+#   2) % of households with ≥1 member with Q15(c) difficulty (separate line + table)
+#
+# Data: data/prep_PEC19.csv (CSO PEC19, Method M2)
+#       data/raw_F4006.csv   (Census 2022 F4006; must include C12/C13 rows)
+#       data/Households_size_2022.csv (columns: size_numeric, households_2022)
 
 from pathlib import Path
 import numpy as np
@@ -11,7 +16,7 @@ import streamlit as st
 
 # ---------------- Page config ----------------
 st.set_page_config(
-    page_title="Households with difficulty climbing stairs — Projections",
+    page_title="Q15(c) difficulty incl. stairs — Projections",
     page_icon="♿",
     layout="wide"
 )
@@ -28,37 +33,36 @@ def band_from_age(age: pd.Series) -> pd.Series:
     out[age >= 65] = "65+"
     return out
 
+def to_title(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.title()
+
 def person_share_to_household_share(q: pd.Series, hh_df: pd.DataFrame) -> pd.Series:
     """
-    Convert person share q to household share p using size model:
-    p = Σ_s h_s * [1 - (1 - q)^s], treating '7+' as size 7.
+    Convert person share q to household share p using the size model:
+    p = Σ_s h_s * [1 - (1 - q)^s], treating '7+' as 7.
     Vectorized over q (Series indexed by year).
     """
     hh = hh_df.copy()
     hh["size_numeric"] = pd.to_numeric(hh["size_numeric"], errors="coerce").fillna(7).astype(int)
-    hs = (hh["households_2022"] / hh["households_2022"].sum()).to_numpy()  # weight by size class
-    s = hh["size_numeric"].to_numpy()                                       # sizes 1..7
-    q_vals = q.to_numpy()[:, None]                                          # (n_years, 1)
-    # probability ≥1 affected in a size-s household, averaged over size distribution
-    p_vals = (1.0 - (1.0 - q_vals) ** s) * hs                               # (n_years, n_sizes)
+    hs = (hh["households_2022"] / hh["households_2022"].sum()).to_numpy()  # weights by size class
+    s = hh["size_numeric"].to_numpy()
+    q_vals = q.to_numpy()[:, None]  # (n_years, 1)
+    p_vals = (1.0 - (1.0 - q_vals) ** s) * hs
     return pd.Series(p_vals.sum(axis=1), index=q.index)
 
-def to_title(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.title()
-
-# -------------- Data load & prep ------------
+# -------------- Load & model ----------------
 @st.cache_data(show_spinner=True)
 def load_inputs():
-    # ---------- Population (PEC19) ----------
+    # --- Population projections (PEC19) ---
     pop = pd.read_csv(DATA_DIR / "prep_PEC19.csv")
     pop.columns = [c.strip() for c in pop.columns]
 
-    # Filter to Method - M2 if column exists
+    # Filter to Method M2 if present
     if "Criteria for Projection" in pop.columns:
         m = pop["Criteria for Projection"].astype(str)
         pop = pop[m.str.contains("Method", na=False) & m.str.contains("M2", na=False)]
 
-    # Standardize population column name to VALUE
+    # Standardize population column to VALUE
     if "VALUE" not in pop.columns:
         for cand in ("Value", "value", "Population", "population"):
             if cand in pop.columns:
@@ -68,7 +72,7 @@ def load_inputs():
         raise ValueError("prep_PEC19.csv must have 'VALUE' (or 'Population').")
     pop["VALUE"] = pd.to_numeric(pop["VALUE"], errors="coerce").fillna(0)
 
-    # Ensure Year/Sex/Band
+    # Ensure Band/Sex
     if "Band" not in pop.columns:
         if "AgeNum" in pop.columns:
             pop["Band"] = band_from_age(pd.to_numeric(pop["AgeNum"], errors="coerce"))
@@ -89,11 +93,9 @@ def load_inputs():
            .rename(columns={"VALUE": "ProjectedPopulation"})
     )
 
-    # ---------- Baseline rates from raw_F4006 (Q15c = C12 + C13 only) ----------
+    # --- Baseline rates for Q15(c) from raw_F4006 (C12 + C13 only, 2022) ---
     raw = pd.read_csv(DATA_DIR / "raw_F4006.csv")
     raw.columns = [c.strip() for c in raw.columns]
-
-    # Normalize value column
     if "VALUE" not in raw.columns:
         for cand in ("Value", "value", "Count", "count"):
             if cand in raw.columns:
@@ -101,104 +103,93 @@ def load_inputs():
                 break
     if "VALUE" not in raw.columns:
         raise ValueError("raw_F4006.csv must have a numeric 'VALUE' column.")
-
-    # If Year exists, keep 2022 snapshot
     if "Year" in raw.columns:
         raw = raw[raw["Year"] == 2022]
 
-    # Q15(c) “to some extent” (C12) + “to a great extent” (C13)
-    keep_codes = {"F4006C12", "F4006C13"}
+    keep_codes = {"F4006C12", "F4006C13"}  # some extent + great extent
     if "STATISTIC" not in raw.columns:
-        raise ValueError("raw_F4006.csv must include a 'STATISTIC' column (e.g., F4006C12, F4006C13).")
+        raise ValueError("raw_F4006.csv must include 'STATISTIC' (e.g., F4006C12, F4006C13).")
     raw_q15c = raw[raw["STATISTIC"].astype(str).isin(keep_codes)].copy()
 
-    # Require Band & Sex
     if "Band" not in raw_q15c.columns:
         raise ValueError("raw_F4006.csv must include 'Band' (0-3, 4-64, 65+).")
     if "Sex" not in raw_q15c.columns:
         raise ValueError("raw_F4006.csv must include 'Sex'.")
     raw_q15c["Sex"] = to_title(raw_q15c["Sex"])
-
-    # Numerics
     raw_q15c["VALUE"] = pd.to_numeric(raw_q15c["VALUE"], errors="coerce").fillna(0)
 
-    # Q15c counts by Band×Sex (2022)
     stairs_2022 = (
         raw_q15c.groupby(["Band", "Sex"], as_index=False)["VALUE"]
                 .sum()
                 .rename(columns={"VALUE": "Q15cCount2022"})
     )
-
-    # Denominator: total 2022 population by Band×Sex from PEC19
     pop_2022 = (
         pop_g[pop_g["Year"] == 2022]
         .groupby(["Band", "Sex"], as_index=False)["ProjectedPopulation"]
         .sum()
         .rename(columns={"ProjectedPopulation": "TotalPop2022"})
     )
-
     base = stairs_2022.merge(pop_2022, on=["Band", "Sex"], how="left")
     if base["TotalPop2022"].isna().any():
         missing = base[base["TotalPop2022"].isna()][["Band", "Sex"]].drop_duplicates()
-        raise ValueError(f"Missing 2022 population for Band×Sex combos in PEC19: \n{missing}")
+        raise ValueError(f"Missing 2022 population for Band×Sex combos in PEC19:\n{missing}")
 
     base["baseline_rate"] = (base["Q15cCount2022"] / base["TotalPop2022"]).clip(0, 1)
 
-    # ---------- Apply baseline to all years ----------
+    # --- Apply baseline to all years ---
     proj = pop_g.merge(base[["Band", "Sex", "baseline_rate"]], on=["Band", "Sex"], how="left")
     if proj["baseline_rate"].isna().any():
         missing = proj[proj["baseline_rate"].isna()][["Band", "Sex"]].drop_duplicates()
-        raise ValueError(f"Missing baseline_rate for Band×Sex combos: \n{missing}")
+        raise ValueError(f"Missing baseline_rate for Band×Sex combos:\n{missing}")
 
-    # Expected persons with Q15c difficulty (incl. climbing stairs)
+    # Persons with Q15c difficulty (all ages; counts)
     proj["ProjectedStairDifficulty"] = proj["ProjectedPopulation"] * proj["baseline_rate"]
 
-    # BUGGY proxy: all children aged 0–3 (regardless of disability)
-    proj["Child0_3_Buggy"] = np.where(proj["Band"] == "0-3", proj["ProjectedPopulation"], 0.0)
+    # Children 0–3 WITH Q15c (counts) — optional view
+    proj["Child0_3_Stairs"] = np.where(proj["Band"] == "0-3", proj["ProjectedStairDifficulty"], 0.0)
 
-    # ---------- Household size mix (2022) ----------
+    # --- Household size distribution ---
     hh = pd.read_csv(DATA_DIR / "Households_size_2022.csv")
     hh.columns = [c.strip() for c in hh.columns]
-    needed = {"size_numeric", "households_2022"}
-    if not needed.issubset(set(hh.columns)):
-        raise ValueError("Households_size_2022.csv needs columns: size_numeric, households_2022")
+    need = {"size_numeric", "households_2022"}
+    if not need.issubset(set(hh.columns)):
+        raise ValueError("Households_size_2022.csv needs: size_numeric, households_2022")
     hh["size_numeric"] = pd.to_numeric(hh["size_numeric"], errors="coerce").fillna(7).astype(int)
     hh["households_2022"] = pd.to_numeric(hh["households_2022"], errors="coerce").fillna(0)
+    hh_total = int(hh["households_2022"].sum())
 
-    return proj, hh, years, base
-
-@st.cache_data(show_spinner=True)
-def build_views(proj: pd.DataFrame, hh: pd.DataFrame):
-    # Totals & shares by year
+    # --- Aggregate to year & compute household percentages ---
     by_year = (
         proj.groupby("Year", as_index=False)
             .agg(total_pop=("ProjectedPopulation", "sum"),
                  stairs=("ProjectedStairDifficulty", "sum"),
-                 child03_buggy=("Child0_3_Buggy", "sum"))
+                 child03_stairs=("Child0_3_Stairs", "sum"))
     )
-    # Person shares
-    by_year["q_member_difficulty"] = by_year["stairs"] / by_year["total_pop"]   # for households with member having Q15c
-    by_year["q_buggy_child"]       = by_year["child03_buggy"] / by_year["total_pop"]  # for households with child 0–3
+    # Person share (Q15c)
+    by_year["q_stairs"] = by_year["stairs"] / by_year["total_pop"]
 
-    # Household percentages
-    by_year["p_member"] = person_share_to_household_share(by_year["q_member_difficulty"], hh)
-    by_year["p_buggy"]  = person_share_to_household_share(by_year["q_buggy_child"], hh)
-    by_year["p_either"] = by_year["p_member"] + by_year["p_buggy"] - by_year["p_member"] * by_year["p_buggy"]
+    # Household share (Q15c)
+    by_year["p_households"] = person_share_to_household_share(by_year["q_stairs"], hh)
+
+    # Percent & count of households (for easy reporting)
+    by_year["pct_households"] = by_year["p_households"] * 100
+    by_year["hh_count"] = (by_year["p_households"] * hh_total).round().astype(int)
 
     # Labels for charts
     band_long = {"0-3": "Ages 0–3 years", "4-64": "Ages 4–64 years", "65+": "Ages 65 years and over"}
     proj_lab = proj.copy()
     proj_lab["BandLabel"] = proj_lab["Band"].map(band_long)
 
-    return by_year, proj_lab
+    return proj_lab, by_year, years, hh_total
 
-# -------------- Load everything -------------
-proj, hh, years, base_rates = load_inputs()
-by_year, proj_labeled = build_views(proj, hh)
+# -------------- Load ------------------------
+proj_labeled, by_year, years, hh_total = load_inputs()
 
 # ---------------- UI -----------------------
-st.title("♿ Households affected by difficulty climbing stairs — Projections")
-st.caption("Member difficulty = Census Q15(c) “to some extent” + “to a great extent” (F4006C12 + F4006C13).  Buggy = any child aged 0–3.  Projections use CSO PEC19 (Method M2).")
+st.title("♿ Difficulty with basic physical activities (incl. climbing stairs) — Projections")
+st.caption("Q15(c) = 'to some extent' (F4006C12) + 'to a great extent' (F4006C13).  "
+           "Projections from CSO PEC19 (Method M2).  "
+           "Household % computed with 2022 household-size mix.")
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -213,29 +204,29 @@ if not sel_sex or not sel_band:
     st.warning("Please select at least one sex and one age band.")
     st.stop()
 
-# -------------- Top KPIs (2022 snapshot) -------------------
+# -------------- KPIs (2022 snapshot) -------------------
 col1, col2, col3, col4 = st.columns(4)
-yr2022 = 2022 if 2022 in years else years[0]
-snap = proj_labeled[proj_labeled["Year"] == yr2022]
-col1.metric(f"Total population ({yr2022})", f"{int(snap['ProjectedPopulation'].sum()):,}")
-col2.metric("People with difficulty (Q15c)", f"{int(snap['ProjectedStairDifficulty'].sum()):,}")
-col3.metric("Children aged 0–3 (buggy)", f"{int(snap['Child0_3_Buggy'].sum()):,}")
-h_row = by_year[by_year["Year"] == yr2022].iloc[0]
-col4.metric("Households affected (either: member difficulty OR buggy)", f"{100*h_row['p_either']:.2f}%")
+yr0 = 2022 if 2022 in years else years[0]
+snap = proj_labeled[proj_labeled["Year"] == yr0]
+col1.metric(f"Total population ({yr0})", f"{int(snap['ProjectedPopulation'].sum()):,}")
+col2.metric("People with Q15(c) difficulty", f"{int(snap['ProjectedStairDifficulty'].sum()):,}")
+col3.metric("Children 0–3 with Q15(c)", f"{int(snap['Child0_3_Stairs'].sum()):,}")
+row0 = by_year[by_year["Year"] == yr0].iloc[0]
+col4.metric("Households with ≥1 Q15(c) member", f"{row0['pct_households']:.2f}%")
+st.caption(f"≈ {row0['hh_count']:,} households in {yr0} (using 2022 total households = {hh_total:,}).")
 
 st.markdown("---")
 
 # -------------- All-years or single-year ---
 if sel_year == "All Years":
     # Persons with Q15c — grouped+stacked by Year→Sex; stacks=age bands
-    st.subheader("Individuals with difficulty (Q15c) — clustered by year and sex; stacks = age bands")
+    st.subheader("Individuals with Q15(c) difficulty — clustered by year and sex; stacks = age bands")
     df_viz = proj_labeled[(proj_labeled["Sex"].isin(sel_sex)) &
                           (proj_labeled["Band"].isin(sel_band))].copy()
     df_viz["Year_str"] = df_viz["Year"].astype(str)
     cat_orders = {
         "Year_str": [str(y) for y in years],
         "Sex": ["Male", "Female"],
-        "Band": band_opt,
         "BandLabel": ["Ages 0–3 years", "Ages 4–64 years", "Ages 65 years and over"]
     }
     fig1 = px.bar(
@@ -245,45 +236,36 @@ if sel_year == "All Years":
         category_orders=cat_orders,
         labels={"Year_str": "Year", "Sex": "Sex",
                 "ProjectedStairDifficulty": "People (count)", "BandLabel": "Age band"},
-        title="Year → Sex clusters; stacks = age bands"
+        title="Year → Sex clusters; stacks = age bands (Q15c)"
     )
     fig1.update_layout(bargap=0.25, legend_title="Age band")
     fig1.update_yaxes(tickformat=",")
     st.plotly_chart(fig1, use_container_width=True)
 
-    # Children 0–3 (buggy) — counts by year × sex
-    st.subheader("Children aged 0–3 (buggy) — people by year and sex")
-    child_viz = (proj_labeled.groupby(["Year", "Sex"], as_index=False)["Child0_3_Buggy"].sum())
+    # Children 0–3 WITH Q15c — counts by year × sex
+    st.subheader("Children aged 0–3 with Q15(c) — people (by year and sex)")
+    child_viz = (proj_labeled.groupby(["Year", "Sex"], as_index=False)["Child0_3_Stairs"].sum())
     child_viz = child_viz[child_viz["Sex"].isin(sel_sex)].copy()
     child_viz["Year_str"] = child_viz["Year"].astype(str)
     fig_child = px.bar(
         child_viz,
-        x=["Year_str", "Sex"], y="Child0_3_Buggy",
+        x=["Year_str", "Sex"], y="Child0_3_Stairs",
         barmode="group", template="plotly_white",
         category_orders={"Year_str": [str(y) for y in years], "Sex": ["Male", "Female"]},
-        labels={"Year_str": "Year", "Sex": "Sex", "Child0_3_Buggy": "People (count)"},
-        title="Year → Sex clusters (children 0–3, buggy)"
+        labels={"Year_str": "Year", "Sex": "Sex", "Child0_3_Stairs": "People (count)"},
+        title="Year → Sex clusters (children 0–3 with Q15c)"
     )
     fig_child.update_yaxes(tickformat=",")
     st.plotly_chart(fig_child, use_container_width=True)
 
-    # Household shares — three lines: member, buggy, either
-    st.subheader("Estimated share of households affected (percentages)")
+    # *** SEPARATE LINE: Percentage of households with ≥1 Q15(c) member ***
+    st.subheader("Percentage of households with ≥1 member with Q15(c) difficulty")
     fig2 = px.line(
-        by_year, x="Year", y=["p_member", "p_buggy", "p_either"],
+        by_year, x="Year", y=["pct_households"],
         markers=True, template="plotly_white",
-        labels={"value": "Share of households", "variable": "Measure"},
-        title="Households with: ≥1 member with difficulty (Q15c), ≥1 child aged 0–3 (buggy), or either"
+        labels={"value": "Share of households (%)", "variable": ""},
+        title="Households with ≥1 member with Q15(c) difficulty"
     )
-    # Convert to %
-    for tr in fig2.data:
-        tr.y = [100*v for v in tr.y]
-    fig2.for_each_trace(lambda t: t.update(name={
-        "p_member": "Member with difficulty (Q15c)",
-        "p_buggy":  "Child aged 0–3 (buggy)",
-        "p_either": "Either: member difficulty OR buggy"
-    }[t.name]))
-    fig2.update_yaxes(title="Share of households (%)", rangemode="tozero")
     st.plotly_chart(fig2, use_container_width=True)
 
 else:
@@ -296,10 +278,10 @@ else:
 
     # Metrics
     c1, c2, c3 = st.columns(3)
-    c1.metric("People with difficulty (Q15c)", f"{int(df_y['ProjectedStairDifficulty'].sum()):,}")
-    c2.metric("Children aged 0–3 (buggy)", f"{int(df_y['Child0_3_Buggy'].sum()):,}")
-    h_row = by_year[by_year["Year"] == year_int].iloc[0]
-    c3.metric("Households affected (either: member difficulty OR buggy)", f"{100*h_row['p_either']:.2f}%")
+    c1.metric("People with Q15(c) difficulty", f"{int(df_y['ProjectedStairDifficulty'].sum()):,}")
+    c2.metric("Children 0–3 with Q15(c)", f"{int(df_y['Child0_3_Stairs'].sum()):,}")
+    row_y = by_year[by_year["Year"] == year_int].iloc[0]
+    c3.metric("Households with ≥1 Q15(c) member", f"{row_y['pct_households']:.2f}%")
 
     # Persons with Q15c — grouped by age band × sex
     fig_bar = px.bar(
@@ -307,27 +289,15 @@ else:
         barmode="group", template="plotly_white",
         category_orders={"Band": ["0-3", "4-64", "65+"], "Sex": ["Male", "Female"]},
         labels={"Band": "Age band", "ProjectedStairDifficulty": "People (count)"},
-        title=f"Individuals with difficulty (Q15c), by age band and sex — {year_int}"
+        title=f"Individuals with Q15(c) difficulty, by age band and sex — {year_int}"
     )
     fig_bar.update_yaxes(tickformat=",")
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Children 0–3 (buggy) by sex for the selected year
-    child_y = (proj_labeled[proj_labeled["Year"] == year_int]
-               .groupby("Sex", as_index=False)["Child0_3_Buggy"].sum())
-    fig_child_y = px.bar(
-        child_y, x="Sex", y="Child0_3_Buggy", template="plotly_white",
-        labels={"Child0_3_Buggy": "People (count)", "Sex": "Sex"},
-        title=f"Children aged 0–3 (buggy) — {year_int}"
-    )
-    fig_child_y.update_yaxes(tickformat=",")
-    st.plotly_chart(fig_child_y, use_container_width=True)
-
-# -------------- Data table (filtered by year) ---------------
+# -------------- Tables ---------------
 st.markdown("---")
-st.subheader("Explore the data")
-
-# Filter by selected year, sex, and band
+st.subheader("Explore the people-level data (filtered)")
+# Filter by selected year, sex, band for the people table
 if sel_year == "All Years":
     mask_year = proj_labeled["Year"].isin(years)
 else:
@@ -335,21 +305,46 @@ else:
 
 mask = mask_year & proj_labeled["Sex"].isin(sel_sex) & proj_labeled["Band"].isin(sel_band)
 show = proj_labeled[mask].copy().sort_values(["Year", "Sex", "Band"])
-
 st.dataframe(
     show[["Year", "Sex", "Band", "ProjectedPopulation", "baseline_rate",
-          "ProjectedStairDifficulty", "Child0_3_Buggy"]]
+          "ProjectedStairDifficulty", "Child0_3_Stairs"]]
       .rename(columns={
           "ProjectedPopulation": "Projected population",
           "baseline_rate": "Baseline Q15(c) rate (decimal)",
-          "ProjectedStairDifficulty": "People with difficulty (Q15c)",
-          "Child0_3_Buggy": "Children aged 0–3 (buggy)"
+          "ProjectedStairDifficulty": "People with Q15(c) difficulty",
+          "Child0_3_Stairs": "Children 0–3 with Q15(c)"
       })
       .style.format({
           "Projected population": "{:,.0f}",
-          "People with difficulty (Q15c)": "{:,.0f}",
-          "Children aged 0–3 (buggy)": "{:,.0f}",
+          "People with Q15(c) difficulty": "{:,.0f}",
+          "Children 0–3 with Q15(c)": "{:,.0f}",
           "Baseline Q15(c) rate (decimal)": "{:.4f}",
       }),
     use_container_width=True
+)
+
+st.subheader("Percentage of households with ≥1 Q15(c) member")
+# Household % table (this is the answer the client wants, as % of households)
+if sel_year == "All Years":
+    table = by_year[["Year", "pct_households", "hh_count"]].copy()
+else:
+    table = by_year[by_year["Year"] == int(sel_year)][["Year", "pct_households", "hh_count"]].copy()
+
+st.dataframe(
+    table.rename(columns={
+        "pct_households": "% of households (≥1 Q15(c) member)",
+        "hh_count": "Households (count, using 2022 total)"
+    }).style.format({
+        "% of households (≥1 Q15(c) member)": "{:.2f}%",
+        "Households (count, using 2022 total)": "{:,}"
+    }),
+    use_container_width=True
+)
+
+# Optional downloads
+st.download_button(
+    "Download household % by year (CSV)",
+    data=by_year[["Year", "pct_households", "hh_count"]].to_csv(index=False).encode("utf-8"),
+    file_name="households_q15c_percentages.csv",
+    mime="text/csv"
 )
